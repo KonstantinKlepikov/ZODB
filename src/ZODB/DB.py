@@ -14,6 +14,8 @@
 """Database objects
 """
 from __future__ import print_function
+
+import contextlib
 import sys
 import logging
 import datetime
@@ -1056,19 +1058,38 @@ class TransactionalUndo(object):
 
     def __init__(self, db, tids):
         self._db = db
-        self._storage = getattr(
-            db._mvcc_storage, 'undo_instance', db._mvcc_storage.new_instance)()
         self._tids = tids
+        self._storage = None
 
     def abort(self, transaction):
         pass
 
+    def close(self):
+        if self._storage is not None:
+            self._storage.close()
+            self._storage = None
+
     def tpc_begin(self, transaction):
+        assert self._storage is None, "Already in an active transaction"
+
         tdata = TransactionMetaData(
             transaction.user,
             transaction.description,
             transaction.extension)
         transaction.set_data(self, tdata)
+        # `undo_instance` is not part of any IStorage interface;
+        # it is defined in our MVCCAdapter. Regardless, we're opening
+        # a new storage instance, and so we must close it to be sure
+        # to reclaim resources in a timely manner.
+        #
+        # Once the tpc_begin method has been called, the transaction manager will
+        # guarantee to call either `tpc_finish` or `tpc_abort`, so those are the only
+        # methods we need to be concerned about calling close() from.
+        self._storage = getattr(
+            self._db._mvcc_storage,
+            'undo_instance',
+            self._db._mvcc_storage.new_instance)()
+
         self._storage.tpc_begin(tdata)
 
     def commit(self, transaction):
@@ -1081,15 +1102,23 @@ class TransactionalUndo(object):
         self._storage.tpc_vote(transaction)
 
     def tpc_finish(self, transaction):
-        transaction = transaction.data(self)
-        self._storage.tpc_finish(transaction)
+        with contextlib.closing(self):
+            transaction = transaction.data(self)
+            self._storage.tpc_finish(transaction)
 
     def tpc_abort(self, transaction):
-        transaction = transaction.data(self)
-        self._storage.tpc_abort(transaction)
+        with contextlib.closing(self):
+            transaction = transaction.data(self)
+            self._storage.tpc_abort(transaction)
 
     def sortKey(self):
-        return "%s:%s" % (self._storage.sortKey(), id(self))
+        # The transaction sorts data managers first before it calls
+        # `tpc_begin`, so we can't use our own storage because it's
+        # not open yet. Fortunately new_instances of a storage are
+        # supposed to return the same sort key as the original storage
+        # did.
+        return "%s:%s" % (self._db._mvcc_storage.sortKey(), id(self))
+
 
 def connection(*args, **kw):
     """Create a database :class:`connection <ZODB.Connection.Connection>`.
